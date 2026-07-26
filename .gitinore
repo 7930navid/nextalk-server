@@ -1,0 +1,26 @@
+# Dependencies
+/node_modules
+
+# Environment variables (Sensitive Data)
+.env
+.env.local
+.env.production
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.log
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor Files
+.vscode/
+.idea/
+
+# Temporary / Build Files
+dist/
+build/
