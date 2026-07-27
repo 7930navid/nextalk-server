@@ -154,3 +154,10 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`🚀 NexTalk Bridge Server running on port ${PORT}`);
 });
+
+
+app.get("/get/:name", (req, res) => {
+  const name = req.params.name;
+  const message = `${name} NexTalk server has been pinged`;
+  res.send(message);
+});
