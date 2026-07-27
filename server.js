@@ -57,17 +57,33 @@ app.post('/api/bridge/drafts', async (req, res) => {
     }
 });
 
-// 2. GET: Fetch pending draft messages for a specific receiver
+// 2. GET & CLEAR: Fetch and delete pending draft messages for a specific receiver
 app.get('/api/bridge/drafts/:receiver_id', async (req, res) => {
+    const client = await pool.connect(); // Transaction-এর জন্য ক্লায়েন্ট কানেক্ট করা হলো
+
     try {
         const { receiver_id } = req.params;
 
-        const query = `
+        await client.query('BEGIN'); // Transaction শুরু
+
+        // ১. আগে ড্রাফট মেসেজগুলো তুলে আনা
+        const selectQuery = `
             SELECT * FROM draft_messages 
             WHERE receiver_id = $1 
             ORDER BY created_at ASC;
         `;
-        const result = await pool.query(query, [receiver_id]);
+        const result = await client.query(selectQuery, [receiver_id]);
+
+        // ২. যদি মেসেজ থাকে, তবে সেগুলো ডিলিট করে দেওয়া
+        if (result.rows.length > 0) {
+            const deleteQuery = `
+                DELETE FROM draft_messages 
+                WHERE receiver_id = $1;
+            `;
+            await client.query(deleteQuery, [receiver_id]);
+        }
+
+        await client.query('COMMIT'); // Transaction সফলভাবে শেষ করা হলো
 
         res.status(200).json({
             success: true,
@@ -75,11 +91,13 @@ app.get('/api/bridge/drafts/:receiver_id', async (req, res) => {
             data: result.rows
         });
     } catch (error) {
-        console.error("GET Error:", error);
+        await client.query('ROLLBACK'); // কোনো ভুল হলে আগের অবস্থায় ফেরত যাওয়া
+        console.error("GET & DELETE Error:", error);
         res.status(500).json({ success: false, error: error.message });
+    } finally {
+        client.release(); // ক্লায়েন্ট রিলিজ করা
     }
 });
-
 // 3. PUT: Update message status (e.g., mark as 'delivered')
 app.put('/api/bridge/drafts/:id', async (req, res) => {
     try {
