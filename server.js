@@ -13,7 +13,7 @@ const server = http.createServer(app);
 ========================= */
 const io = new Server(server, {
   cors: {
-    origin: "*", // আপনার ফ্রন্টএন্ড URL দিতে পারেন
+    origin: "*",
     methods: ["GET", "POST", "PUT", "DELETE"]
   }
 });
@@ -44,13 +44,12 @@ pool.connect((err, client, release) => {
 /* =========================
    SOCKET.IO REAL-TIME LOGIC
 ========================= */
-// অনলাইনে থাকা ইউজারদের ট্র্যাকিং (userId -> socketId)
 const onlineUsers = new Map();
 
 io.on("connection", (socket) => {
     console.log("⚡ User connected:", socket.id);
 
-    // ইউজার অনলাইন হলে এবং নিজের রুম জয়েন করলে
+    // ১. ইউজার রেজিস্ট্রেশন
     socket.on("register_user", (userId) => {
         if (userId) {
             socket.join(userId);
@@ -59,31 +58,58 @@ io.on("connection", (socket) => {
         }
     });
 
-    // মেসেজ রিসিভ ও রিডাইরেক্ট করা
+    // ২. মেসেজ সেন্ড
     socket.on("send_message", async (data) => {
-        const { sender_id, receiver_id, text, media } = data;
+        const { msgId, sender_id, receiver_id, message_text, original_text, media_payload, is_edited, is_deleted } = data;
 
-        // প্রাপক যদি এখন অনলাইনে থাকে
         if (onlineUsers.has(receiver_id)) {
             io.to(receiver_id).emit("receive_message", {
+                msgId,
                 sender_id,
                 receiver_id,
-                message_text: text,
-                media_payload: media,
-                created_at: new Date()
+                message_text,
+                original_text: original_text || message_text,
+                media_payload,
+                created_at: new Date(),
+                is_edited: is_edited || false,
+                is_deleted: is_deleted || false
             });
         } else {
-            // প্রাপক অফলাইনে থাকলে ড্যাটাবেজে ড্রাফট হিসেব সেভ করা
             try {
                 const query = `
-                    INSERT INTO draft_messages (sender_id, receiver_id, message_text, media_payload)
-                    VALUES ($1, $2, $3, $4);
+                    INSERT INTO draft_messages (msg_id, sender_id, receiver_id, message_text, original_text, media_payload, is_edited, is_deleted)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
                 `;
-                await pool.query(query, [sender_id, receiver_id, text || null, media ? JSON.stringify(media) : null]);
+                await pool.query(query, [
+                    msgId, 
+                    sender_id, 
+                    receiver_id, 
+                    message_text || null, 
+                    original_text || message_text || null, 
+                    media_payload ? JSON.stringify(media_payload) : null,
+                    is_edited || false,
+                    is_deleted || false
+                ]);
                 console.log(`📥 Message saved to draft queue for offline user: ${receiver_id}`);
             } catch (err) {
                 console.error("❌ Failed to save draft message via Socket:", err);
             }
+        }
+    });
+
+    // ৩. মেসেজ এডিট (Socket)
+    socket.on("edit_message", (data) => {
+        const { msgId, receiver_id, new_text } = data;
+        if (onlineUsers.has(receiver_id)) {
+            io.to(receiver_id).emit("message_edited", { msgId, new_text });
+        }
+    });
+
+    // ৪. মেসেজ ডিলিট (Socket)
+    socket.on("delete_message", (data) => {
+        const { msgId, receiver_id } = data;
+        if (onlineUsers.has(receiver_id)) {
+            io.to(receiver_id).emit("message_deleted", { msgId });
         }
     });
 
@@ -102,36 +128,63 @@ io.on("connection", (socket) => {
    REST API ROUTES FOR DRAFT MESSAGES
    ========================================================= */
 
-// 1. POST: Save message to Draft DB via HTTP
+// ১. POST: Save or Update Draft message (Handle New, Edit, and Delete Sync)
 app.post('/api/bridge/drafts', async (req, res) => {
     try {
-        const { sender_id, receiver_id, text, media } = req.body;
+        const { msgId, sender_id, receiver_id, message_text, original_text, media_payload, is_edited, is_deleted } = req.body;
 
         if (!sender_id || !receiver_id) {
             return res.status(400).json({ success: false, error: "Sender and Receiver IDs are required." });
         }
 
-        const query = `
-            INSERT INTO draft_messages (sender_id, receiver_id, message_text, media_payload)
-            VALUES ($1, $2, $3, $4)
-            RETURNING *;
-        `;
-        const values = [sender_id, receiver_id, text || null, media ? JSON.stringify(media) : null];
+        // Check if message already exists in draft
+        const checkQuery = `SELECT * FROM draft_messages WHERE msg_id = $1 OR (sender_id = $2 AND receiver_id = $3 AND message_text = $4 LIMIT 1);`;
+        const existing = await pool.query(checkQuery, [msgId, sender_id, receiver_id, message_text]);
 
-        const result = await pool.query(query, values);
+        let result;
+        if (existing.rows.length > 0) {
+            // Update existing message record (e.g. edited or deleted)
+            const updateQuery = `
+                UPDATE draft_messages 
+                SET message_text = COALESCE($1, message_text),
+                    is_edited = COALESCE($2, is_edited),
+                    is_deleted = COALESCE($3, is_deleted)
+                WHERE msg_id = $4 OR id = $5
+                RETURNING *;
+            `;
+            result = await pool.query(updateQuery, [message_text, is_edited, is_deleted, msgId, existing.rows[0].id]);
+        } else {
+            // Insert new draft record
+            const insertQuery = `
+                INSERT INTO draft_messages (msg_id, sender_id, receiver_id, message_text, original_text, media_payload, is_edited, is_deleted)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING *;
+            `;
+            const values = [
+                msgId || 'msg_' + Date.now(), 
+                sender_id, 
+                receiver_id, 
+                message_text || null, 
+                original_text || message_text || null, 
+                media_payload ? JSON.stringify(media_payload) : null,
+                is_edited || false,
+                is_deleted || false
+            ];
+            result = await pool.query(insertQuery, values);
+        }
 
         res.status(201).json({
             success: true,
-            message: "Draft message queued successfully",
+            message: "Draft message saved/synced successfully",
             data: result.rows[0]
         });
     } catch (error) {
-        console.error("POST Error:", error);
+        console.error("POST Draft Error:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// 2. GET & CLEAR: Fetch and delete pending draft messages for a specific receiver
+// ২. GET & CLEAR: Fetch and delete pending draft messages for receiver
 app.get('/api/bridge/drafts/:receiver_id', async (req, res) => {
     const client = await pool.connect();
 
@@ -141,7 +194,18 @@ app.get('/api/bridge/drafts/:receiver_id', async (req, res) => {
         await client.query('BEGIN');
 
         const selectQuery = `
-            SELECT * FROM draft_messages 
+            SELECT 
+                id,
+                msg_id AS "msgId",
+                sender_id,
+                receiver_id,
+                message_text,
+                original_text,
+                media_payload,
+                is_edited,
+                is_deleted,
+                created_at
+            FROM draft_messages 
             WHERE receiver_id = $1 
             ORDER BY created_at ASC;
         `;
@@ -171,76 +235,7 @@ app.get('/api/bridge/drafts/:receiver_id', async (req, res) => {
     }
 });
 
-// 3. PUT: Update message status
-app.put('/api/bridge/drafts/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { status } = req.body;
-
-        const query = `
-            UPDATE draft_messages 
-            SET status = $1 
-            WHERE id = $2 
-            RETURNING *;
-        `;
-        const result = await pool.query(query, [status, id]);
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, error: "Message draft not found." });
-        }
-
-        res.status(200).json({
-            success: true,
-            message: "Draft status updated",
-            data: result.rows[0]
-        });
-    } catch (error) {
-        console.error("PUT Error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// 4. DELETE: Single message
-app.delete('/api/bridge/drafts/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        const query = `DELETE FROM draft_messages WHERE id = $1 RETURNING *;`;
-        const result = await pool.query(query, [id]);
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, error: "Draft not found or already deleted." });
-        }
-
-        res.status(200).json({
-            success: true,
-            message: "Draft message removed from server queue."
-        });
-    } catch (error) {
-        console.error("DELETE Error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// 5. DELETE ALL
-app.delete('/api/bridge/drafts/clear/:receiver_id', async (req, res) => {
-    try {
-        const { receiver_id } = req.params;
-
-        const query = `DELETE FROM draft_messages WHERE receiver_id = $1;`;
-        await pool.query(query, [receiver_id]);
-
-        res.status(200).json({
-            success: true,
-            message: `All synced draft messages cleared for receiver: ${receiver_id}`
-        });
-    } catch (error) {
-        console.error("CLEAR ALL Error:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// Ping route
+// ৩. Ping route
 app.get("/get/:name", (req, res) => {
   const name = req.params.name;
   res.send(`${name} NexTalk server has been pinged`);
