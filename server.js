@@ -137,8 +137,12 @@ app.post('/api/bridge/drafts', async (req, res) => {
             return res.status(400).json({ success: false, error: "Sender and Receiver IDs are required." });
         }
 
-        // Check if message already exists in draft
-        const checkQuery = `SELECT * FROM draft_messages WHERE msg_id = $1 OR (sender_id = $2 AND receiver_id = $3 AND message_text = $4 LIMIT 1);`;
+        // ✅ FIXED: Correct SQL Syntax for SELECT query with LIMIT
+        const checkQuery = `
+            SELECT * FROM draft_messages 
+            WHERE msg_id = $1 OR (sender_id = $2 AND receiver_id = $3 AND message_text = $4) 
+            LIMIT 1;
+        `;
         const existing = await pool.query(checkQuery, [msgId, sender_id, receiver_id, message_text]);
 
         let result;
